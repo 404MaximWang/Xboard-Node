@@ -37,6 +37,14 @@ type Config struct {
 	// panel URL/token, kernel type, log settings and runtime tuning.
 	Nodes []NodeEntry `yaml:"nodes,omitempty"`
 
+	// Fallbacks is the process-wide default xray fallback list (camouflage
+	// destinations for VLESS/Trojan inbounds), in xray's native FallbackObject
+	// shape: "dest" is required, name/alpn/path/xver optional. Fallback targets
+	// are node-local by nature (e.g. a local nginx), so this is configured here
+	// rather than pushed by the panel. Per-node entries may override it via
+	// nodes[].fallbacks. Only the xray kernel consumes it.
+	Fallbacks []map[string]any `yaml:"fallbacks,omitempty"`
+
 	// Machine enables machine mode: a single process manages all nodes
 	// bound to this machine on the panel. Nodes are discovered dynamically
 	// via GET /api/v2/server/machine/nodes. When set, Panel.NodeID, Nodes
@@ -60,6 +68,9 @@ type NodeEntry struct {
 	Kernel *KernelOverride `yaml:"kernel,omitempty"`
 	// Cert allows per-node certificate overrides. nil = inherit global.
 	Cert *CertConfig `yaml:"cert,omitempty"`
+	// Fallbacks overrides the top-level fallbacks for this node.
+	// nil = inherit the top-level value.
+	Fallbacks []map[string]any `yaml:"fallbacks,omitempty"`
 }
 
 // KernelOverride holds the subset of KernelConfig that is useful to override
@@ -513,6 +524,11 @@ func (c *Config) inheritFrom(parent *Config) {
 	if len(c.Kernel.CustomRoute) == 0 {
 		c.Kernel.CustomRoute = parent.Kernel.CustomRoute
 	}
+	// Fallbacks (node-local xray camouflage destinations).
+	// nil = inherit; an explicit empty list clears the inherited value.
+	if c.Fallbacks == nil {
+		c.Fallbacks = parent.Fallbacks
+	}
 	// Cert (NOT cert_dir — derived from config_dir later)
 	if c.Cert.CertMode == "" {
 		c.Cert.CertMode = parent.Cert.CertMode
@@ -786,6 +802,11 @@ func (c *Config) ExpandNodes() []*Config {
 		}
 		if nodeCfg.Cert.CertDir == "" {
 			nodeCfg.Cert.CertDir = filepath.Join(nodeCfg.Kernel.ConfigDir, "certs")
+		}
+
+		// Per-node fallbacks override
+		if entry.Fallbacks != nil {
+			nodeCfg.Fallbacks = entry.Fallbacks
 		}
 
 		result = append(result, &nodeCfg)

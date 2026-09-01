@@ -150,6 +150,11 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 		k = singbox.New(cfg.Kernel)
 	}
 
+	if len(cfg.Fallbacks) > 0 && cfg.Kernel.Type != "xray" {
+		nlog.Core().Warn("fallbacks configured in config.yml but only the xray kernel supports them; ignoring",
+			"kernel", cfg.Kernel.Type)
+	}
+
 	l := limiter.New()
 	st := limiter.NewSpeedTracker(l)
 
@@ -288,6 +293,7 @@ func (s *Service) initialSetup(ctx context.Context) error {
 		}
 		return fmt.Errorf("initial config is nil")
 	}
+	s.applyLocalNodeConfig(bootstrap.Config)
 	if err := validateNodeRuntime(s.cfg, s.kernel.Protocols(), bootstrap.Config, s.cert.TLSCert()); err != nil {
 		return err
 	}
@@ -316,6 +322,19 @@ func (s *Service) initialSetup(ctx context.Context) error {
 	}
 	s.markMailboxReadyAndDrain(ctx)
 	return nil
+}
+
+// applyLocalNodeConfig injects node-local config.yml settings into a freshly
+// arrived spec, before validation and hashing. Fallbacks are node-local by
+// nature (the camouflage target runs on this machine), so they come from
+// config.yml only — panel data never populates this field.
+func (s *Service) applyLocalNodeConfig(nc *model.NodeSpec) {
+	if nc == nil {
+		return
+	}
+	if len(s.cfg.Fallbacks) > 0 {
+		nc.Fallbacks = s.cfg.Fallbacks
+	}
 }
 
 // applyRemoteOverrides updates service-level settings (log level, cert config)
@@ -539,6 +558,7 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		if event.Config == nil {
 			return
 		}
+		s.applyLocalNodeConfig(event.Config)
 		newConfigHash := computeConfigHash(event.Config)
 		if newConfigHash == s.lastConfigHash {
 			return
@@ -623,6 +643,7 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 
 		result := pullResult{certChanged: certChanged}
 		if snapshot.Config != nil {
+			s.applyLocalNodeConfig(snapshot.Config)
 			result.config = snapshot.Config
 			result.configHash = computeConfigHash(snapshot.Config)
 			if result.configHash == currentConfigHash && !certChanged {

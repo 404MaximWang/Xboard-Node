@@ -29,6 +29,10 @@ type NodeSpec struct {
 	Decryption  string
 	TLSSettings map[string]any
 
+	// Fallbacks carries the node-local xray fallback list (from config.yml,
+	// injected by the service layer). Never populated from panel data.
+	Fallbacks []map[string]any
+
 	Host       string
 	ServerName string
 
