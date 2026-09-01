@@ -4,7 +4,9 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -277,6 +279,7 @@ func buildVLESS(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TL
 	}
 
 	applyStreamSettings(base, nc, tc)
+	applyFallback(base, nc)
 	return base
 }
 
@@ -302,7 +305,308 @@ func buildTrojan(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.T
 		applyStreamSettings(base, nc, tc)
 	}
 
+	applyFallback(base, nc)
 	return base
+}
+
+// buildFallbacks reads tls_settings for a VLESS/Trojan inbound and returns
+// xray-native fallback objects (nil when nothing is configured). Source keys,
+// in priority order:
+//
+//   - fallbacks:        native xray array (or a single object) of FallbackObjects
+//   - fallback:         sing-box style single source: "host:port" or {server, server_port}
+//   - fallback_server + fallback_port
+//
+// The config-local node.trojan_fallback override is applied by the service
+// layer (applyLocalOverrides) into TLSSettings["fallback"], so it flows through
+// the "fallback" branch here automatically.
+func buildFallbacks(nc *model.NodeSpec) []M {
+	if nc == nil || nc.TLSSettings == nil {
+		return nil
+	}
+	if raw, ok := nc.TLSSettings["fallbacks"]; ok {
+		return normalizeFallbacks(raw)
+	}
+	if raw, ok := nc.TLSSettings["fallback"]; ok {
+		if fb := normalizeFallbackItem(raw); fb != nil {
+			return []M{fb}
+		}
+		return nil
+	}
+	server := strings.TrimSpace(stringFromAny(nc.TLSSettings["fallback_server"]))
+	if server == "" {
+		return nil
+	}
+	port := intFromAny(nc.TLSSettings["fallback_port"])
+	dest, ok := fallbackDestFromServerPort(server, port)
+	if !ok {
+		return nil
+	}
+	return []M{M{"dest": dest}}
+}
+
+// normalizeFallbacks converts any supported shape of tls_settings.fallbacks
+// (array, single object, map[string]string) into []M of xray FallbackObjects.
+// Unparseable entries are dropped; nil is returned when nothing survives.
+func normalizeFallbacks(raw any) []M {
+	var items []any
+	switch v := raw.(type) {
+	case []any:
+		items = v
+	case []map[string]any:
+		items = make([]any, len(v))
+		for i := range v {
+			items[i] = v[i]
+		}
+	case map[string]any:
+		items = []any{v}
+	case map[string]string:
+		m := make(map[string]any, len(v))
+		for k, val := range v {
+			m[k] = val
+		}
+		items = []any{m}
+	default:
+		return nil
+	}
+	fallbacks := make([]M, 0, len(items))
+	for _, item := range items {
+		if fb := normalizeFallbackItem(item); fb != nil {
+			fallbacks = append(fallbacks, fb)
+		}
+	}
+	if len(fallbacks) == 0 {
+		return nil
+	}
+	return fallbacks
+}
+
+// normalizeFallbackItem normalizes one element of a fallback source: either a
+// "host:port" string or an object map. Returns nil when unparseable.
+func normalizeFallbackItem(item any) M {
+	switch v := item.(type) {
+	case string:
+		dest, ok := parseFallbackAddress(v)
+		if !ok {
+			return nil
+		}
+		return M{"dest": dest}
+	case map[string]any:
+		fb, ok := normalizeFallbackObject(v)
+		if !ok {
+			return nil
+		}
+		return fb
+	case map[string]string:
+		m := make(map[string]any, len(v))
+		for k, val := range v {
+			m[k] = val
+		}
+		fb, ok := normalizeFallbackObject(m)
+		if !ok {
+			return nil
+		}
+		return fb
+	default:
+		return nil
+	}
+}
+
+// normalizeFallbackObject normalizes one raw map into an xray FallbackObject.
+// A "dest" key wins (native xray form); otherwise the sing-box style
+// server/server_port (or host/port, server/port) form is converted to dest.
+// Returns (nil, false) when no usable destination is found.
+func normalizeFallbackObject(raw map[string]any) (M, bool) {
+	dest := strings.TrimSpace(stringFromAny(raw["dest"]))
+	if dest != "" {
+		normalized, ok := parseFallbackAddress(dest)
+		if !ok {
+			return nil, false
+		}
+		dest = normalized
+	} else {
+		server := strings.TrimSpace(stringFromAny(firstMapValue(raw, "server", "host", "address")))
+		if server == "" {
+			return nil, false
+		}
+		port := intFromAny(firstMapValue(raw, "server_port", "port"))
+		d, ok := fallbackDestFromServerPort(server, port)
+		if !ok {
+			return nil, false
+		}
+		dest = d
+	}
+
+	out := M{"dest": dest}
+	if name := strings.TrimSpace(stringFromAny(raw["name"])); name != "" {
+		out["name"] = name
+	}
+	if alpn := strings.TrimSpace(stringFromAny(raw["alpn"])); alpn != "" {
+		out["alpn"] = alpn
+	}
+	if path := strings.TrimSpace(stringFromAny(raw["path"])); path != "" {
+		out["path"] = path
+	}
+	if xver := intFromAny(raw["xver"]); xver > 0 {
+		out["xver"] = xver
+	}
+	return out, true
+}
+
+// fallbackDestFromServerPort joins a server and port into a "host:port" dest.
+// A zero port falls back to parsing the server string itself (covers the
+// {server: "host:port"} shorthand).
+func fallbackDestFromServerPort(server string, port int) (string, bool) {
+	if port <= 0 || port > 65535 {
+		return parseFallbackAddress(server)
+	}
+	return net.JoinHostPort(server, strconv.Itoa(port)), true
+}
+
+// parseFallbackAddress validates and normalizes a fallback destination.
+// Accepts "host:port", a bare numeric port (xray resolves it to localhost),
+// and Unix domain socket paths ("/..." absolute or "@..." abstract).
+func parseFallbackAddress(addr string) (string, bool) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "", false
+	}
+	// Bare numeric port: xray auto-fills localhost.
+	if port, err := strconv.Atoi(addr); err == nil {
+		if port <= 0 || port > 65535 {
+			return "", false
+		}
+		return addr, true
+	}
+	// Unix domain socket dest.
+	if strings.HasPrefix(addr, "/") || strings.HasPrefix(addr, "@") {
+		return addr, true
+	}
+	if host, portStr, err := net.SplitHostPort(addr); err == nil {
+		port, err := strconv.Atoi(portStr)
+		if err != nil || port <= 0 || port > 65535 {
+			return "", false
+		}
+		return net.JoinHostPort(host, portStr), true
+	}
+	parts := strings.Split(addr, ":")
+	if len(parts) != 2 {
+		return "", false
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil || port <= 0 || port > 65535 {
+		return "", false
+	}
+	return net.JoinHostPort(strings.TrimSpace(parts[0]), strconv.Itoa(port)), true
+}
+
+// applyFallback injects settings.fallbacks for VLESS/Trojan inbounds and
+// enforces the xray precondition (tcp transport + tls/reality security).
+// No-op when no fallback is configured or the transport/security cannot
+// support one. Must be called after applyStreamSettings so the final
+// streamSettings (network/security/tlsSettings) are in place.
+func applyFallback(base M, nc *model.NodeSpec) {
+	fallbacks := buildFallbacks(nc)
+	if len(fallbacks) == 0 {
+		return
+	}
+	ss, ok := base["streamSettings"].(M)
+	if !ok {
+		return
+	}
+	network, _ := ss["network"].(string)
+	if network != "" && network != "tcp" {
+		nlog.Core().Warn("xray: fallbacks only supported on tcp transport; skipping",
+			"protocol", nc.Protocol, "network", network)
+		return
+	}
+	security, _ := ss["security"].(string)
+	if security != "tls" && security != "reality" {
+		nlog.Core().Warn("xray: fallbacks require tls or reality security; skipping",
+			"protocol", nc.Protocol, "security", security)
+		return
+	}
+	settings, ok := base["settings"].(M)
+	if !ok {
+		return
+	}
+	settings["fallbacks"] = fallbacks
+	ensureFallbackALPN(ss, nc, security)
+}
+
+// ensureFallbackALPN ensures the inbound TLS/Reality advertises http/1.1, which
+// xray requires when fallbacks are configured. An explicit alpn (on the TLS
+// object or in tls_settings) is never overridden.
+func ensureFallbackALPN(ss M, nc *model.NodeSpec, security string) {
+	var target M
+	var ok bool
+	switch security {
+	case "tls":
+		target, ok = ss["tlsSettings"].(M)
+	case "reality":
+		target, ok = ss["realitySettings"].(M)
+	}
+	if !ok || target == nil {
+		return
+	}
+	if _, exists := target["alpn"]; exists {
+		return
+	}
+	if nc != nil && nc.TLSSettings != nil {
+		if raw, exists := nc.TLSSettings["alpn"]; exists && raw != nil {
+			target["alpn"] = raw
+			return
+		}
+	}
+	target["alpn"] = []string{"http/1.1"}
+}
+
+func stringFromAny(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case fmt.Stringer:
+		return v.String()
+	case nil:
+		return ""
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+func intFromAny(value any) int {
+	switch v := value.(type) {
+	case int:
+		return v
+	case int32:
+		return int(v)
+	case int64:
+		return int(v)
+	case uint:
+		return int(v)
+	case uint32:
+		return int(v)
+	case uint64:
+		return int(v)
+	case float32:
+		return int(v)
+	case float64:
+		return int(v)
+	case string:
+		i, _ := strconv.Atoi(strings.TrimSpace(v))
+		return i
+	default:
+		return 0
+	}
+}
+
+func firstMapValue(m map[string]any, keys ...string) any {
+	for _, key := range keys {
+		if value, ok := m[key]; ok {
+			return value
+		}
+	}
+	return nil
 }
 
 type ss2022Config struct {

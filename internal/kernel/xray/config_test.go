@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -568,6 +570,395 @@ func TestExtractECHServerKeys(t *testing.T) {
 			got := extractECHServerKeys(tt.tls)
 			if got != tt.expect {
 				t.Errorf("got %q, want %q", got, tt.expect)
+			}
+		})
+	}
+}
+
+// ── xray fallbacks (inbound settings.fallbacks) ────────────────────────
+
+func getFallbacks(t *testing.T, cfg M) []map[string]interface{} {
+	t.Helper()
+	inbounds, ok := cfg["inbounds"].([]M)
+	if !ok || len(inbounds) == 0 {
+		t.Fatalf("expected inbounds in config")
+	}
+	settings, ok := inbounds[0]["settings"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	fb, _ := settings["fallbacks"].([]map[string]interface{})
+	return fb
+}
+
+func hasFallbacks(t *testing.T, cfg M) bool {
+	t.Helper()
+	inbounds, ok := cfg["inbounds"].([]M)
+	if !ok || len(inbounds) == 0 {
+		return false
+	}
+	settings, ok := inbounds[0]["settings"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	_, exists := settings["fallbacks"]
+	return exists
+}
+
+// getTLSConfig returns the tlsSettings or realitySettings object, whichever the
+// inbound's security mode produced.
+func getTLSConfig(t *testing.T, cfg M) map[string]interface{} {
+	t.Helper()
+	inbounds, ok := cfg["inbounds"].([]M)
+	if !ok || len(inbounds) == 0 {
+		t.Fatalf("expected inbounds in config")
+	}
+	ss, ok := inbounds[0]["streamSettings"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected streamSettings")
+	}
+	if tls, ok := ss["tlsSettings"].(map[string]interface{}); ok {
+		return tls
+	}
+	if real, ok := ss["realitySettings"].(map[string]interface{}); ok {
+		return real
+	}
+	return nil
+}
+
+func assertAlpnEquals(t *testing.T, tls map[string]interface{}, want []string) {
+	t.Helper()
+	if tls == nil {
+		t.Fatalf("expected TLS settings object, got nil")
+	}
+	raw, ok := tls["alpn"]
+	if !ok {
+		t.Fatalf("expected alpn %v in TLS settings, got none", want)
+	}
+	var got []string
+	switch v := raw.(type) {
+	case []string:
+		got = v
+	case []interface{}:
+		for _, s := range v {
+			got = append(got, fmt.Sprintf("%v", s))
+		}
+	default:
+		t.Fatalf("alpn has unexpected type %T", raw)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("alpn = %v, want %v", got, want)
+	}
+}
+
+func TestBuildInbound_VLESS_FallbackString(t *testing.T) {
+	nc := &panel.NodeConfig{
+		Protocol:   "vless",
+		ServerPort: 443,
+		TLS:        1,
+		TLSSettings: map[string]interface{}{
+			"fallback": "127.0.0.1:8080",
+		},
+	}
+	cfg := buildConfig(testKernelCfg, testNodeSpec(nc), testUsers, kernel.TLSCert{})
+	fb := getFallbacks(t, cfg)
+	if len(fb) != 1 {
+		t.Fatalf("fallbacks len = %d, want 1 (%#v)", len(fb), fb)
+	}
+	if fb[0]["dest"] != "127.0.0.1:8080" {
+		t.Errorf("dest = %v, want 127.0.0.1:8080", fb[0]["dest"])
+	}
+	assertAlpnEquals(t, getTLSConfig(t, cfg), []string{"http/1.1"})
+}
+
+func TestBuildInbound_VLESS_FallbackMap(t *testing.T) {
+	nc := &panel.NodeConfig{
+		Protocol:   "vless",
+		ServerPort: 443,
+		TLS:        1,
+		TLSSettings: map[string]interface{}{
+			"fallback": map[string]interface{}{
+				"server":      "127.0.0.1",
+				"server_port": "8081",
+			},
+		},
+	}
+	cfg := buildConfig(testKernelCfg, testNodeSpec(nc), testUsers, kernel.TLSCert{})
+	fb := getFallbacks(t, cfg)
+	if len(fb) != 1 {
+		t.Fatalf("fallbacks len = %d, want 1", len(fb))
+	}
+	if fb[0]["dest"] != "127.0.0.1:8081" {
+		t.Errorf("dest = %v, want 127.0.0.1:8081", fb[0]["dest"])
+	}
+}
+
+func TestBuildInbound_VLESS_FallbackServerPortFields(t *testing.T) {
+	nc := &panel.NodeConfig{
+		Protocol:   "vless",
+		ServerPort: 443,
+		TLS:        1,
+		TLSSettings: map[string]interface{}{
+			"fallback_server": "127.0.0.1",
+			"fallback_port":   "8080",
+		},
+	}
+	cfg := buildConfig(testKernelCfg, testNodeSpec(nc), testUsers, kernel.TLSCert{})
+	fb := getFallbacks(t, cfg)
+	if len(fb) != 1 {
+		t.Fatalf("fallbacks len = %d, want 1", len(fb))
+	}
+	if fb[0]["dest"] != "127.0.0.1:8080" {
+		t.Errorf("dest = %v, want 127.0.0.1:8080", fb[0]["dest"])
+	}
+}
+
+func TestBuildInbound_Trojan_FallbackString(t *testing.T) {
+	nc := &panel.NodeConfig{
+		Protocol:   "trojan",
+		ServerPort: 10443,
+		TLS:        1,
+		ServerName: "sg3.oone.us",
+		TLSSettings: map[string]interface{}{
+			"fallback": "127.0.0.1:8080",
+		},
+	}
+	cfg := buildConfig(testKernelCfg, testNodeSpec(nc), testUsers, kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")})
+	fb := getFallbacks(t, cfg)
+	if len(fb) != 1 {
+		t.Fatalf("fallbacks len = %d, want 1", len(fb))
+	}
+	if fb[0]["dest"] != "127.0.0.1:8080" {
+		t.Errorf("dest = %v, want 127.0.0.1:8080", fb[0]["dest"])
+	}
+	assertAlpnEquals(t, getTLSConfig(t, cfg), []string{"http/1.1"})
+}
+
+func TestBuildInbound_Trojan_FallbackMap(t *testing.T) {
+	nc := &panel.NodeConfig{
+		Protocol:   "trojan",
+		ServerPort: 10443,
+		TLS:        1,
+		ServerName: "sg3.oone.us",
+		TLSSettings: map[string]interface{}{
+			"fallback": map[string]interface{}{
+				"server":      "127.0.0.1",
+				"server_port": "8081",
+			},
+		},
+	}
+	cfg := buildConfig(testKernelCfg, testNodeSpec(nc), testUsers, kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")})
+	fb := getFallbacks(t, cfg)
+	if len(fb) != 1 {
+		t.Fatalf("fallbacks len = %d, want 1", len(fb))
+	}
+	if fb[0]["dest"] != "127.0.0.1:8081" {
+		t.Errorf("dest = %v, want 127.0.0.1:8081", fb[0]["dest"])
+	}
+}
+
+func TestBuildInbound_FallbacksArray(t *testing.T) {
+	nc := &panel.NodeConfig{
+		Protocol:   "vless",
+		ServerPort: 443,
+		TLS:        1,
+		TLSSettings: map[string]interface{}{
+			"fallbacks": []map[string]interface{}{
+				{
+					"name": "example.com",
+					"alpn": "http/1.1",
+					"path": "/vless",
+					"dest": "127.0.0.1:8081",
+					"xver": "1",
+				},
+				{
+					"dest": "127.0.0.1:8082",
+				},
+			},
+		},
+	}
+	cfg := buildConfig(testKernelCfg, testNodeSpec(nc), testUsers, kernel.TLSCert{})
+	fb := getFallbacks(t, cfg)
+	if len(fb) != 2 {
+		t.Fatalf("fallbacks len = %d, want 2 (%#v)", len(fb), fb)
+	}
+	first := fb[0]
+	if first["name"] != "example.com" || first["alpn"] != "http/1.1" || first["path"] != "/vless" || first["dest"] != "127.0.0.1:8081" {
+		t.Errorf("first fallback = %#v", first)
+	}
+	if first["xver"] != 1 {
+		t.Errorf("xver = %#v (%T), want int 1", first["xver"], first["xver"])
+	}
+	if fb[1]["dest"] != "127.0.0.1:8082" {
+		t.Errorf("second dest = %v, want 127.0.0.1:8082", fb[1]["dest"])
+	}
+}
+
+func TestBuildInbound_FallbacksSingleMapWrapped(t *testing.T) {
+	nc := &panel.NodeConfig{
+		Protocol:   "vless",
+		ServerPort: 443,
+		TLS:        1,
+		TLSSettings: map[string]interface{}{
+			"fallbacks": map[string]interface{}{
+				"dest": "127.0.0.1:8080",
+			},
+		},
+	}
+	cfg := buildConfig(testKernelCfg, testNodeSpec(nc), testUsers, kernel.TLSCert{})
+	fb := getFallbacks(t, cfg)
+	if len(fb) != 1 {
+		t.Fatalf("fallbacks len = %d, want 1", len(fb))
+	}
+	if fb[0]["dest"] != "127.0.0.1:8080" {
+		t.Errorf("dest = %v, want 127.0.0.1:8080", fb[0]["dest"])
+	}
+}
+
+func TestBuildInbound_Fallback_NonTCP_Skipped(t *testing.T) {
+	nc := &panel.NodeConfig{
+		Protocol:   "vless",
+		ServerPort: 443,
+		Network:    "ws",
+		TLS:        1,
+		TLSSettings: map[string]interface{}{
+			"fallback": "127.0.0.1:8080",
+		},
+	}
+	cfg := buildConfig(testKernelCfg, testNodeSpec(nc), testUsers, kernel.TLSCert{})
+	if hasFallbacks(t, cfg) {
+		t.Error("fallbacks should not be emitted for ws transport")
+	}
+}
+
+func TestBuildInbound_Fallback_NoTLS_Skipped(t *testing.T) {
+	nc := &panel.NodeConfig{
+		Protocol:   "vless",
+		ServerPort: 443,
+		TLSSettings: map[string]interface{}{
+			"fallback": "127.0.0.1:8080",
+		},
+	}
+	cfg := buildConfig(testKernelCfg, testNodeSpec(nc), testUsers, kernel.TLSCert{})
+	if hasFallbacks(t, cfg) {
+		t.Error("fallbacks should not be emitted without tls/reality security")
+	}
+}
+
+func TestBuildInbound_Fallback_RespectsUserAlpn(t *testing.T) {
+	nc := &panel.NodeConfig{
+		Protocol:   "vless",
+		ServerPort: 443,
+		TLS:        1,
+		TLSSettings: map[string]interface{}{
+			"fallback": "127.0.0.1:8080",
+			"alpn":     []interface{}{"h2"},
+		},
+	}
+	cfg := buildConfig(testKernelCfg, testNodeSpec(nc), testUsers, kernel.TLSCert{})
+	if !hasFallbacks(t, cfg) {
+		t.Fatal("fallbacks should be emitted")
+	}
+	assertAlpnEquals(t, getTLSConfig(t, cfg), []string{"h2"})
+}
+
+func TestBuildInbound_Fallback_Reality(t *testing.T) {
+	nc := &panel.NodeConfig{
+		Protocol:   "vless",
+		ServerPort: 443,
+		TLS:        2,
+		TLSSettings: map[string]interface{}{
+			"private_key": "pk",
+			"server_name": "example.com",
+			"fallback":    "127.0.0.1:8080",
+		},
+	}
+	cfg := buildConfig(testKernelCfg, testNodeSpec(nc), testUsers, kernel.TLSCert{})
+	fb := getFallbacks(t, cfg)
+	if len(fb) != 1 || fb[0]["dest"] != "127.0.0.1:8080" {
+		t.Fatalf("fallbacks = %#v, want single dest 127.0.0.1:8080", fb)
+	}
+	assertAlpnEquals(t, getTLSConfig(t, cfg), []string{"http/1.1"})
+}
+
+func TestBuildFallbacks_Normalization(t *testing.T) {
+	tests := []struct {
+		name     string
+		tls      map[string]interface{}
+		wantLen  int
+		wantDest []string
+		wantXver int
+	}{
+		{
+			name: "xver string coerced to int",
+			tls: map[string]interface{}{
+				"fallbacks": []interface{}{
+					map[string]interface{}{"dest": "127.0.0.1:8080", "xver": "2"},
+				},
+			},
+			wantLen:  1,
+			wantDest: []string{"127.0.0.1:8080"},
+			wantXver: 2,
+		},
+		{
+			name: "entry missing dest dropped",
+			tls: map[string]interface{}{
+				"fallbacks": []interface{}{
+					map[string]interface{}{"dest": "127.0.0.1:8080"},
+					map[string]interface{}{"path": "/x"},
+				},
+			},
+			wantLen:  1,
+			wantDest: []string{"127.0.0.1:8080"},
+		},
+		{
+			name: "dest wins over server",
+			tls: map[string]interface{}{
+				"fallback": map[string]interface{}{"server": "10.0.0.1", "dest": "127.0.0.1:8080"},
+			},
+			wantLen:  1,
+			wantDest: []string{"127.0.0.1:8080"},
+		},
+		{
+			name: "map[string]string fallback",
+			tls: map[string]interface{}{
+				"fallback": map[string]string{"server": "127.0.0.1", "server_port": "8083"},
+			},
+			wantLen:  1,
+			wantDest: []string{"127.0.0.1:8083"},
+		},
+		{
+			name:    "nothing configured",
+			tls:     map[string]interface{}{},
+			wantLen: 0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nc := testNodeSpec(&panel.NodeConfig{
+				Protocol:    "vless",
+				ServerPort:  443,
+				TLSSettings: tt.tls,
+			})
+			fb := buildFallbacks(nc)
+			if tt.wantLen == 0 {
+				if fb != nil {
+					t.Fatalf("buildFallbacks = %#v, want nil", fb)
+				}
+				return
+			}
+			if len(fb) != tt.wantLen {
+				t.Fatalf("buildFallbacks len = %d, want %d (%#v)", len(fb), tt.wantLen, fb)
+			}
+			for i, dest := range tt.wantDest {
+				if fb[i]["dest"] != dest {
+					t.Errorf("fallbacks[%d].dest = %v, want %s", i, fb[i]["dest"], dest)
+				}
+			}
+			if tt.wantXver != 0 {
+				if fb[0]["xver"] != tt.wantXver {
+					t.Errorf("fallbacks[0].xver = %#v (%T), want %d", fb[0]["xver"], fb[0]["xver"], tt.wantXver)
+				}
 			}
 		})
 	}
