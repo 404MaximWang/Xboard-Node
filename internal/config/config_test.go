@@ -543,3 +543,41 @@ func TestInheritFrom_AutoTLSInheritedWhenChildHasNoCertConfig(t *testing.T) {
 		t.Error("auto_tls should be inherited when child has no cert config")
 	}
 }
+
+func TestFallbacks_InheritanceSemantics(t *testing.T) {
+	global := []map[string]any{{"dest": "127.0.0.1:8080"}}
+	parent := &Config{Fallbacks: global}
+
+	// instances: nil inherits the top-level value.
+	child := &Config{}
+	child.inheritFrom(parent)
+	if len(child.Fallbacks) != 1 {
+		t.Errorf("nil fallbacks should inherit, got %v", child.Fallbacks)
+	}
+
+	// instances: an explicit empty list clears the inherited value.
+	child = &Config{Fallbacks: []map[string]any{}}
+	child.inheritFrom(parent)
+	if child.Fallbacks == nil || len(child.Fallbacks) != 0 {
+		t.Errorf("explicit empty fallbacks should clear inherited value, got %v", child.Fallbacks)
+	}
+
+	// nodes: entry without fallbacks inherits; entry with its own overrides.
+	c := &Config{
+		Fallbacks: global,
+		Nodes: []NodeEntry{
+			{NodeID: 1},
+			{NodeID: 2, Fallbacks: []map[string]any{{"dest": "10.0.0.1:9090"}}},
+		},
+	}
+	cfgs := c.ExpandNodes()
+	if len(cfgs) != 2 {
+		t.Fatalf("ExpandNodes len = %d, want 2", len(cfgs))
+	}
+	if len(cfgs[0].Fallbacks) != 1 || cfgs[0].Fallbacks[0]["dest"] != "127.0.0.1:8080" {
+		t.Errorf("node 1 should inherit top-level fallbacks, got %v", cfgs[0].Fallbacks)
+	}
+	if len(cfgs[1].Fallbacks) != 1 || cfgs[1].Fallbacks[0]["dest"] != "10.0.0.1:9090" {
+		t.Errorf("node 2 should override fallbacks, got %v", cfgs[1].Fallbacks)
+	}
+}

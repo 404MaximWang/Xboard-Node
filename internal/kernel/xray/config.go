@@ -4,7 +4,9 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -277,6 +279,7 @@ func buildVLESS(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TL
 	}
 
 	applyStreamSettings(base, nc, tc)
+	applyFallback(base, nc)
 	return base
 }
 
@@ -302,7 +305,190 @@ func buildTrojan(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.T
 		applyStreamSettings(base, nc, tc)
 	}
 
+	applyFallback(base, nc)
 	return base
+}
+
+// buildFallbacks converts the node-local fallback list (config.yml, carried on
+// the spec by the service layer) into xray-native FallbackObjects for a
+// VLESS/Trojan inbound. Each entry needs a valid "dest"; name/alpn/path/xver
+// are optional and pass through untouched. Entries without a usable dest are
+// dropped with a warning; nil is returned when nothing survives.
+func buildFallbacks(nc *model.NodeSpec) []M {
+	if nc == nil || len(nc.Fallbacks) == 0 {
+		return nil
+	}
+	fallbacks := make([]M, 0, len(nc.Fallbacks))
+	for _, raw := range nc.Fallbacks {
+		if fb := normalizeFallback(raw); fb != nil {
+			fallbacks = append(fallbacks, fb)
+		} else {
+			nlog.Core().Warn("xray: dropping fallback entry without valid dest", "value", raw)
+		}
+	}
+	if len(fallbacks) == 0 {
+		return nil
+	}
+	return fallbacks
+}
+
+// normalizeFallback validates one raw fallback object: "dest" is required and
+// must be a valid address; name/alpn/path/xver pass through untouched.
+// Returns nil when dest is missing or unparseable.
+func normalizeFallback(raw map[string]any) M {
+	dest, ok := parseFallbackAddress(stringFromAny(raw["dest"]))
+	if !ok {
+		return nil
+	}
+	out := M{"dest": dest}
+	if name := strings.TrimSpace(stringFromAny(raw["name"])); name != "" {
+		out["name"] = name
+	}
+	if alpn := strings.TrimSpace(stringFromAny(raw["alpn"])); alpn != "" {
+		out["alpn"] = alpn
+	}
+	if path := strings.TrimSpace(stringFromAny(raw["path"])); path != "" {
+		out["path"] = path
+	}
+	if xver := intFromAny(raw["xver"]); xver > 0 {
+		out["xver"] = xver
+	}
+	return out
+}
+
+// parseFallbackAddress validates and normalizes a fallback destination.
+// Accepts "host:port", a bare numeric port (xray resolves it to localhost),
+// and Unix domain socket paths ("/..." absolute or "@..." abstract).
+func parseFallbackAddress(addr string) (string, bool) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "", false
+	}
+	// Bare numeric port: xray auto-fills localhost.
+	if port, err := strconv.Atoi(addr); err == nil {
+		if port <= 0 || port > 65535 {
+			return "", false
+		}
+		return addr, true
+	}
+	// Unix domain socket dest.
+	if strings.HasPrefix(addr, "/") || strings.HasPrefix(addr, "@") {
+		return addr, true
+	}
+	if host, portStr, err := net.SplitHostPort(addr); err == nil {
+		port, err := strconv.Atoi(portStr)
+		if err != nil || port <= 0 || port > 65535 {
+			return "", false
+		}
+		return net.JoinHostPort(host, portStr), true
+	}
+	parts := strings.Split(addr, ":")
+	if len(parts) != 2 {
+		return "", false
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil || port <= 0 || port > 65535 {
+		return "", false
+	}
+	return net.JoinHostPort(strings.TrimSpace(parts[0]), strconv.Itoa(port)), true
+}
+
+// applyFallback injects settings.fallbacks for VLESS/Trojan inbounds and
+// enforces the xray precondition (tcp transport + tls/reality security).
+// No-op when no fallback is configured or the transport/security cannot
+// support one. Must be called after applyStreamSettings so the final
+// streamSettings (network/security/tlsSettings) are in place.
+func applyFallback(base M, nc *model.NodeSpec) {
+	fallbacks := buildFallbacks(nc)
+	if len(fallbacks) == 0 {
+		return
+	}
+	ss, ok := base["streamSettings"].(M)
+	if !ok {
+		return
+	}
+	network, _ := ss["network"].(string)
+	if network != "" && network != "tcp" {
+		nlog.Core().Warn("xray: fallbacks only supported on tcp transport; skipping",
+			"protocol", nc.Protocol, "network", network)
+		return
+	}
+	security, _ := ss["security"].(string)
+	if security != "tls" && security != "reality" {
+		nlog.Core().Warn("xray: fallbacks require tls or reality security; skipping",
+			"protocol", nc.Protocol, "security", security)
+		return
+	}
+	settings, ok := base["settings"].(M)
+	if !ok {
+		return
+	}
+	settings["fallbacks"] = fallbacks
+	ensureFallbackALPN(ss, nc, security)
+}
+
+// ensureFallbackALPN ensures a TLS inbound advertises http/1.1, which xray
+// requires when fallbacks are configured. An explicit alpn (on the TLS
+// object or in tls_settings) is never overridden. Reality has no alpn
+// setting — fallback alpn matching uses the client's ClientHello — so this
+// is a no-op for reality.
+func ensureFallbackALPN(ss M, nc *model.NodeSpec, security string) {
+	if security != "tls" {
+		return
+	}
+	target, ok := ss["tlsSettings"].(M)
+	if !ok || target == nil {
+		return
+	}
+	if _, exists := target["alpn"]; exists {
+		return
+	}
+	if nc != nil && nc.TLSSettings != nil {
+		if raw, exists := nc.TLSSettings["alpn"]; exists && raw != nil {
+			target["alpn"] = raw
+			return
+		}
+	}
+	target["alpn"] = []string{"http/1.1"}
+}
+
+func stringFromAny(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case fmt.Stringer:
+		return v.String()
+	case nil:
+		return ""
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+func intFromAny(value any) int {
+	switch v := value.(type) {
+	case int:
+		return v
+	case int32:
+		return int(v)
+	case int64:
+		return int(v)
+	case uint:
+		return int(v)
+	case uint32:
+		return int(v)
+	case uint64:
+		return int(v)
+	case float32:
+		return int(v)
+	case float64:
+		return int(v)
+	case string:
+		i, _ := strconv.Atoi(strings.TrimSpace(v))
+		return i
+	default:
+		return 0
+	}
 }
 
 type ss2022Config struct {

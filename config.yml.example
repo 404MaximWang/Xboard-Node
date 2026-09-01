@@ -7,6 +7,23 @@
 #   token: "your-api-key"
 #   node_id: 1
 
+# ── xray fallbacks (camouflage) ──
+# Node-local fallback destinations for VLESS/Trojan inbounds (xray kernel
+# only): TLS connections that don't authenticate as proxy traffic are
+# transparently forwarded here, so the server looks like a normal website.
+# xray-native FallbackObject shape: dest required, name/alpn/path/xver
+# optional. Requires tcp transport + tls/reality security.
+# fallbacks:
+#   - dest: "127.0.0.1:8080"
+#   - name: "www.example.com"     # match SNI
+#     alpn: "http/1.1"            # match ALPN
+#     path: "/blog"               # match HTTP path
+#     dest: "127.0.0.1:8081"
+#     xver: 1                     # send PROXY protocol v1 to the target
+# Multi-node mode: nodes[].fallbacks overrides this top-level value.
+# In multi-instance/multi-node configs: omit to inherit the top-level value,
+# or set "fallbacks: []" to explicitly disable fallbacks for that entry.
+
 # ── Multiple instances ──
 # kernel:
 #   type: "singbox"
