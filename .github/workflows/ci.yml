@@ -116,6 +116,15 @@ jobs:
         with:
           merge-multiple: true
           path: dist
+      - name: Delete stale rolling dev release
+        # action-gh-release never moves an existing tag, which would leave the
+        # auto-generated source archives pinned to an old commit while the
+        # binaries get overwritten. Rebuild the rolling dev release from
+        # scratch so tag, source archives and binaries all match HEAD.
+        if: github.ref == 'refs/heads/dev'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release delete dev --cleanup-tag -y || true
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
